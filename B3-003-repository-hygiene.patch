@@ -1,0 +1,50 @@
+From 73565bbabafed9262af5503d42ef95ba00fb2c60 Mon Sep 17 00:00:00 2001
+From: Engineering Governor <engineering@vguard.ai>
+Date: Mon, 13 Jul 2026 14:15:09 +0000
+Subject: [PATCH] [B3-003] Repository Hygiene
+
+Move misplaced internal/runtime files to package-matching directories:
+- internal/runtime/event.go          -> internal/audit/event.go
+- internal/runtime/publisher.go      -> internal/audit/publisher.go
+- internal/runtime/publisher_test.go -> internal/audit/publisher_test.go
+- internal/runtime/checksum.go       -> internal/config/checksum.go
+- B3-003.patch archived as historical artifact -> archive/B3-003.patch
+
+No file contents modified. No imports edited. No go.mod, Makefile,
+docs, or .github added. Scope: repository hygiene only.
+---
+ B3-003.patch => archive/B3-003.patch          | 0
+ internal/{runtime => audit}/event.go          | 0
+ internal/{runtime => audit}/publisher.go      | 0
+ internal/{runtime => audit}/publisher_test.go | 0
+ internal/{runtime => config}/checksum.go      | 0
+ 5 files changed, 0 insertions(+), 0 deletions(-)
+ rename B3-003.patch => archive/B3-003.patch (100%)
+ rename internal/{runtime => audit}/event.go (100%)
+ rename internal/{runtime => audit}/publisher.go (100%)
+ rename internal/{runtime => audit}/publisher_test.go (100%)
+ rename internal/{runtime => config}/checksum.go (100%)
+
+diff --git a/B3-003.patch b/archive/B3-003.patch
+similarity index 100%
+rename from B3-003.patch
+rename to archive/B3-003.patch
+diff --git a/internal/runtime/event.go b/internal/audit/event.go
+similarity index 100%
+rename from internal/runtime/event.go
+rename to internal/audit/event.go
+diff --git a/internal/runtime/publisher.go b/internal/audit/publisher.go
+similarity index 100%
+rename from internal/runtime/publisher.go
+rename to internal/audit/publisher.go
+diff --git a/internal/runtime/publisher_test.go b/internal/audit/publisher_test.go
+similarity index 100%
+rename from internal/runtime/publisher_test.go
+rename to internal/audit/publisher_test.go
+diff --git a/internal/runtime/checksum.go b/internal/config/checksum.go
+similarity index 100%
+rename from internal/runtime/checksum.go
+rename to internal/config/checksum.go
+-- 
+2.43.0
+
