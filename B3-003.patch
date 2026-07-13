@@ -1,0 +1,1798 @@
+From 925640ffad418c64c97c3341a66133688f818fa5 Mon Sep 17 00:00:00 2001
+From: "Claude (AI Engineering Assistant)" <claude@vguard.ai>
+Date: Mon, 13 Jul 2026 03:36:29 +0000
+Subject: [PATCH] [B3-003] Implement Request Validator, Audit Publisher Stub,
+ and Configuration Provider
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- internal/validator: schema-only DecisionRequest validation (EG-003),
+  deterministic, panic-free, 100% branch coverage.
+- internal/audit: Publisher interface + InMemoryPublisher stub, thread-safe,
+  no stdout, mock-friendly, 100% coverage including concurrent race tests.
+- internal/config: generic checksum-verified, immutable, no-hot-reload
+  configuration Provider[T], decoder-agnostic (EG-004), 100% coverage.
+- contracts/decision_request.go: reference DecisionRequest shape (see
+  file header — replace with actual frozen contract if it already exists
+  in this repository, initial commit c9b682c).
+
+Verified locally: go build ./..., go vet ./..., gofmt -l . (clean),
+go test ./... -race -cover (100.0% all packages).
+
+NOT verified locally: golangci-lint, govulncheck (unavailable in the
+sandboxed execution environment — no access to proxy.golang.org /
+pkg.go.dev). Please run these in CI before merging.
+
+Go version note: authored and tested against Go 1.22.2 (only version
+available in the sandboxed environment); go.mod in this patch declares
+'go 1.22' for that reason. The real repository's go.mod (Go 1.24) should
+be preserved — only the new files under internal/validator, internal/audit,
+internal/config, and contracts/ are intended to be merged in, not this
+patch's go.mod line.
+---
+ contracts/decision_request.go            |  46 +++
+ go.mod                                   |   3 +
+ internal/audit/event.go                  |  45 +++
+ internal/audit/publisher.go              |  96 +++++
+ internal/audit/publisher_test.go         | 184 ++++++++++
+ internal/config/checksum.go              |  59 ++++
+ internal/config/provider.go              | 137 ++++++++
+ internal/config/provider_test.go         | 331 ++++++++++++++++++
+ internal/config/yaml_provider.go.snippet |  54 +++
+ internal/validator/request_validator.go  | 204 +++++++++++
+ internal/validator/validation_error.go   |  77 ++++
+ internal/validator/validator_test.go     | 428 +++++++++++++++++++++++
+ 12 files changed, 1664 insertions(+)
+ create mode 100644 contracts/decision_request.go
+ create mode 100644 go.mod
+ create mode 100644 internal/audit/event.go
+ create mode 100644 internal/audit/publisher.go
+ create mode 100644 internal/audit/publisher_test.go
+ create mode 100644 internal/config/checksum.go
+ create mode 100644 internal/config/provider.go
+ create mode 100644 internal/config/provider_test.go
+ create mode 100644 internal/config/yaml_provider.go.snippet
+ create mode 100644 internal/validator/request_validator.go
+ create mode 100644 internal/validator/validation_error.go
+ create mode 100644 internal/validator/validator_test.go
+
+diff --git a/contracts/decision_request.go b/contracts/decision_request.go
+new file mode 100644
+index 0000000..2dfe314
+--- /dev/null
++++ b/contracts/decision_request.go
+@@ -0,0 +1,46 @@
++// Package contracts defines the canonical wire contracts for the V-Guard
++// Decision Engine. This file is a REFERENCE IMPLEMENTATION.
++//
++// ASSUMPTION NOTICE (read before merging):
++// The engineering handoff for Sprint B3-003 states that contracts/ already
++// exists as part of the frozen Production Architecture Baseline (PAB-1),
++// created in the initial bootstrap commit (c9b682c). This repository was
++// not accessible from the execution environment used to produce this patch
++// (authentication required), so the exact existing DecisionRequest shape
++// could not be read.
++//
++// If contracts/decision_request.go ALREADY EXISTS in the repository:
++//  1. Discard this file.
++//  2. Adjust the field references in internal/validator/request_validator.go
++//     to match the real contract. The validation RULES and ERROR SHAPE are
++//     contract-agnostic and do not need to change — only the field access
++//     expressions do.
++//
++// If it does NOT exist yet, this is a reasonable canonical shape based on
++// the fields already flowing through the V-Guard pipeline (POS intake ->
++// Fraud Processing Engine), and can be used as-is.
++package contracts
++
++import "time"
++
++// DecisionRequest is the canonical input to the Decision Engine.
++// It is intentionally free of any business-logic fields (risk scores,
++// thresholds, etc.) — those are produced BY the engine, never received.
++type DecisionRequest struct {
++	CorrelationID string    `json:"correlation_id"`
++	TransactionID string    `json:"transaction_id"`
++	StoreID       string    `json:"store_id"`
++	CashierID     string    `json:"cashier_id"`
++	Amount        float64   `json:"amount"`
++	Currency      string    `json:"currency"`
++	Items         []Item    `json:"items"`
++	Timestamp     time.Time `json:"timestamp"`
++}
++
++// Item represents a single line item within a transaction.
++type Item struct {
++	SKU       string  `json:"sku"`
++	Name      string  `json:"name"`
++	Quantity  int     `json:"quantity"`
++	UnitPrice float64 `json:"unit_price"`
++}
+diff --git a/go.mod b/go.mod
+new file mode 100644
+index 0000000..f87848f
+--- /dev/null
++++ b/go.mod
+@@ -0,0 +1,3 @@
++module github.com/vguard-ai/decision-engine
++
++go 1.22
+diff --git a/internal/audit/event.go b/internal/audit/event.go
+new file mode 100644
+index 0000000..e3ddbbe
+--- /dev/null
++++ b/internal/audit/event.go
+@@ -0,0 +1,45 @@
++// Package audit defines the audit event contract and publisher interface
++// used by the Decision Engine to emit an immutable trail of everything it
++// does, without coupling the core engine to any specific transport
++// (Kafka, HTTP, file, etc.) — per EG-004.
++package audit
++
++import "time"
++
++// EventType is a closed enumeration of audit event kinds the Decision
++// Engine core is aware of. Downstream consumers (e.g. a Kafka-backed
++// Publisher implementation) may recognize additional types, but the core
++// only ever emits these.
++type EventType string
++
++const (
++	EventValidationFailed EventType = "VALIDATION_FAILED"
++	EventValidationPassed EventType = "VALIDATION_PASSED"
++	EventDecisionMade     EventType = "DECISION_MADE"
++	EventEngineError      EventType = "ENGINE_ERROR"
++)
++
++// Event is a single immutable audit record. It carries no behavior — pure
++// data, safe to serialize, safe to share across goroutines once
++// constructed (fields should not be mutated after creation).
++type Event struct {
++	// CorrelationID ties this event back to a single end-to-end request,
++	// consistent with the correlation_id used across the wider V-Guard
++	// platform (POS intake, Fraud Processing Engine, dashboards).
++	CorrelationID string
++	// TransactionID identifies the underlying business transaction, when
++	// known. May be empty for events that occur before a transaction ID
++	// is available (e.g. a request that fails validation before parsing).
++	TransactionID string
++	// Type is the kind of event being recorded.
++	Type EventType
++	// Payload carries event-specific structured detail. Callers are
++	// responsible for ensuring payload values are themselves safe for
++	// concurrent read access (e.g. avoid storing pointers to mutable
++	// state); prefer plain values or already-serialized data.
++	Payload map[string]any
++	// OccurredAt is the timestamp the event was generated. Set by the
++	// caller (not the publisher) so it reflects when the fact became
++	// true, not when it was transported/persisted.
++	OccurredAt time.Time
++}
+diff --git a/internal/audit/publisher.go b/internal/audit/publisher.go
+new file mode 100644
+index 0000000..99c98a0
+--- /dev/null
++++ b/internal/audit/publisher.go
+@@ -0,0 +1,96 @@
++package audit
++
++import (
++	"context"
++	"errors"
++	"sync"
++)
++
++// ErrPublisherClosed is returned by Publish and Close when called on a
++// Publisher that has already been closed.
++var ErrPublisherClosed = errors.New("audit: publisher is closed")
++
++// Publisher is the boundary the Decision Engine core depends on to emit
++// audit events. It is intentionally minimal and transport-agnostic — a
++// real deployment might implement this backed by Kafka, a message queue,
++// or direct database writes, but none of that leaks into this interface
++// or into the core engine (EG-004). The core only ever imports this
++// interface, never a concrete transport.
++type Publisher interface {
++	// Publish emits a single audit event. Implementations must be safe
++	// for concurrent use by multiple goroutines.
++	Publish(ctx context.Context, event Event) error
++	// Close releases any resources held by the publisher and rejects
++	// further Publish calls. Close must be safe to call at most once
++	// meaningfully; subsequent calls return ErrPublisherClosed.
++	Close() error
++}
++
++// InMemoryPublisher is a stub Publisher implementation for local
++// development, unit tests, and as a safe default at the composition root
++// before a real transport is wired in. It performs NO I/O — no stdout, no
++// stderr, no network, no disk — and never panics.
++//
++// It is safe for concurrent use (EG-002 adjacent: while Publisher itself
++// is allowed to hold state, unlike the stateless Decision Engine core,
++// that state must be correctly synchronized, which this type guarantees
++// via an internal mutex).
++type InMemoryPublisher struct {
++	mu     sync.RWMutex
++	events []Event
++	closed bool
++}
++
++// NewInMemoryPublisher constructs a ready-to-use InMemoryPublisher.
++func NewInMemoryPublisher() *InMemoryPublisher {
++	return &InMemoryPublisher{events: make([]Event, 0)}
++}
++
++// Publish appends event to the in-memory log. Returns ctx.Err() if the
++// context is already canceled/expired, and ErrPublisherClosed if Close
++// has already been called. Never blocks and never performs I/O.
++func (p *InMemoryPublisher) Publish(ctx context.Context, event Event) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++
++	p.mu.Lock()
++	defer p.mu.Unlock()
++
++	if p.closed {
++		return ErrPublisherClosed
++	}
++	p.events = append(p.events, event)
++	return nil
++}
++
++// Close marks the publisher as closed. Further Publish calls will return
++// ErrPublisherClosed. Calling Close more than once returns
++// ErrPublisherClosed on the second and subsequent calls.
++func (p *InMemoryPublisher) Close() error {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++
++	if p.closed {
++		return ErrPublisherClosed
++	}
++	p.closed = true
++	return nil
++}
++
++// Events returns a snapshot copy of every event published so far. Safe to
++// call concurrently with Publish/Close. Intended for test assertions and
++// local debugging — not part of the Publisher interface itself, since
++// production transports (e.g. Kafka) would not support reading back their
++// own history this way.
++func (p *InMemoryPublisher) Events() []Event {
++	p.mu.RLock()
++	defer p.mu.RUnlock()
++
++	out := make([]Event, len(p.events))
++	copy(out, p.events)
++	return out
++}
++
++// compile-time assertion that InMemoryPublisher satisfies Publisher.
++var _ Publisher = (*InMemoryPublisher)(nil)
+diff --git a/internal/audit/publisher_test.go b/internal/audit/publisher_test.go
+new file mode 100644
+index 0000000..d5fc7ec
+--- /dev/null
++++ b/internal/audit/publisher_test.go
+@@ -0,0 +1,184 @@
++package audit
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestInMemoryPublisher_Publish(t *testing.T) {
++	tests := []struct {
++		name    string
++		setup   func(p *InMemoryPublisher)
++		ctx     func() context.Context
++		event   Event
++		wantErr error
++	}{
++		{
++			name: "publishes successfully on an open publisher",
++			ctx:  context.Background,
++			event: Event{
++				CorrelationID: "corr-1",
++				TransactionID: "txn-1",
++				Type:          EventValidationPassed,
++				OccurredAt:    time.Now(),
++			},
++			wantErr: nil,
++		},
++		{
++			name: "returns ErrPublisherClosed after Close",
++			setup: func(p *InMemoryPublisher) {
++				if err := p.Close(); err != nil {
++					t.Fatalf("setup Close failed: %v", err)
++				}
++			},
++			ctx: context.Background,
++			event: Event{
++				CorrelationID: "corr-2",
++				Type:          EventEngineError,
++			},
++			wantErr: ErrPublisherClosed,
++		},
++		{
++			name: "returns context error when context already canceled",
++			ctx: func() context.Context {
++				ctx, cancel := context.WithCancel(context.Background())
++				cancel()
++				return ctx
++			},
++			event: Event{
++				CorrelationID: "corr-3",
++				Type:          EventDecisionMade,
++			},
++			wantErr: context.Canceled,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			p := NewInMemoryPublisher()
++			if tt.setup != nil {
++				tt.setup(p)
++			}
++
++			err := p.Publish(tt.ctx(), tt.event)
++
++			if tt.wantErr == nil {
++				if err != nil {
++					t.Fatalf("expected no error, got %v", err)
++				}
++				if len(p.Events()) != 1 {
++					t.Fatalf("expected 1 event recorded, got %d", len(p.Events()))
++				}
++				return
++			}
++
++			if !errors.Is(err, tt.wantErr) {
++				t.Fatalf("expected error %v, got %v", tt.wantErr, err)
++			}
++		})
++	}
++}
++
++func TestInMemoryPublisher_Close(t *testing.T) {
++	p := NewInMemoryPublisher()
++
++	if err := p.Close(); err != nil {
++		t.Fatalf("first Close() should succeed, got %v", err)
++	}
++
++	err := p.Close()
++	if !errors.Is(err, ErrPublisherClosed) {
++		t.Fatalf("second Close() should return ErrPublisherClosed, got %v", err)
++	}
++}
++
++func TestInMemoryPublisher_Events_ReturnsSnapshotCopy(t *testing.T) {
++	p := NewInMemoryPublisher()
++	ctx := context.Background()
++
++	if err := p.Publish(ctx, Event{CorrelationID: "corr-1", Type: EventDecisionMade}); err != nil {
++		t.Fatalf("Publish failed: %v", err)
++	}
++
++	snapshot := p.Events()
++	if len(snapshot) != 1 {
++		t.Fatalf("expected 1 event, got %d", len(snapshot))
++	}
++
++	// Mutating the returned slice must not affect internal state.
++	snapshot[0].CorrelationID = "mutated"
++
++	fresh := p.Events()
++	if fresh[0].CorrelationID != "corr-1" {
++		t.Fatalf("internal state was mutated via returned snapshot: got %q", fresh[0].CorrelationID)
++	}
++}
++
++// TestInMemoryPublisher_ConcurrentPublish exercises the publisher from
++// many goroutines simultaneously. Run with -race to verify thread-safety
++// (EG requirement: "Thread-safe").
++func TestInMemoryPublisher_ConcurrentPublish(t *testing.T) {
++	p := NewInMemoryPublisher()
++	ctx := context.Background()
++
++	const goroutines = 50
++	const eventsPerGoroutine = 20
++
++	var wg sync.WaitGroup
++	wg.Add(goroutines)
++
++	for g := 0; g < goroutines; g++ {
++		go func(id int) {
++			defer wg.Done()
++			for i := 0; i < eventsPerGoroutine; i++ {
++				_ = p.Publish(ctx, Event{
++					CorrelationID: "concurrent-test",
++					Type:          EventValidationPassed,
++					OccurredAt:    time.Now(),
++				})
++			}
++		}(g)
++	}
++
++	wg.Wait()
++
++	got := len(p.Events())
++	want := goroutines * eventsPerGoroutine
++	if got != want {
++		t.Fatalf("expected %d events after concurrent publish, got %d", want, got)
++	}
++}
++
++// TestInMemoryPublisher_ConcurrentPublishAndClose ensures Close racing
++// with Publish never panics and always resolves deterministically to
++// either success or ErrPublisherClosed for each call.
++func TestInMemoryPublisher_ConcurrentPublishAndClose(t *testing.T) {
++	p := NewInMemoryPublisher()
++	ctx := context.Background()
++
++	var wg sync.WaitGroup
++	wg.Add(2)
++
++	go func() {
++		defer wg.Done()
++		for i := 0; i < 100; i++ {
++			_ = p.Publish(ctx, Event{CorrelationID: "race-test", Type: EventEngineError})
++		}
++	}()
++
++	go func() {
++		defer wg.Done()
++		_ = p.Close()
++	}()
++
++	wg.Wait()
++	// No assertion beyond "did not panic and did not deadlock" — the
++	// race detector (go test -race) is what actually proves correctness.
++}
++
++func TestInMemoryPublisher_ImplementsPublisherInterface(t *testing.T) {
++	var _ Publisher = NewInMemoryPublisher()
++}
+diff --git a/internal/config/checksum.go b/internal/config/checksum.go
+new file mode 100644
+index 0000000..0597d77
+--- /dev/null
++++ b/internal/config/checksum.go
+@@ -0,0 +1,59 @@
++package config
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"fmt"
++	"os"
++	"strings"
++)
++
++// ErrChecksumMismatch is returned when the computed checksum of a config
++// file does not match the expected checksum supplied by the caller.
++type ErrChecksumMismatch struct {
++	Path     string
++	Expected string
++	Actual   string
++}
++
++func (e *ErrChecksumMismatch) Error() string {
++	return fmt.Sprintf("config: checksum mismatch for %q: expected %s, got %s", e.Path, e.Expected, e.Actual)
++}
++
++// Checksum computes the lowercase hex-encoded SHA-256 digest of raw bytes.
++// This is the canonical checksum format used throughout this package —
++// callers producing an expected checksum (e.g. as part of a release
++// pipeline) should use this same function to generate it.
++func Checksum(raw []byte) string {
++	sum := sha256.Sum256(raw)
++	return hex.EncodeToString(sum[:])
++}
++
++// ChecksumFile computes the Checksum of the file at path. Intended as a
++// build/release-time helper (e.g. a small `go run` tool that prints the
++// checksum of a config file to commit alongside it) rather than for use
++// in the hot request path.
++func ChecksumFile(path string) (string, error) {
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return "", fmt.Errorf("config: reading file for checksum %q: %w", path, err)
++	}
++	return Checksum(raw), nil
++}
++
++// readChecksumFile reads a sidecar checksum file (convention:
++// "<config>.sha256") and returns the trimmed hex digest it contains.
++// The file may contain either a bare digest or the common
++// "<digest>  <filename>" format produced by tools like sha256sum; both
++// are accepted by taking only the first whitespace-delimited token.
++func readChecksumFile(path string) (string, error) {
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return "", fmt.Errorf("config: reading checksum file %q: %w", path, err)
++	}
++	fields := strings.Fields(string(raw))
++	if len(fields) == 0 {
++		return "", fmt.Errorf("config: checksum file %q is empty", path)
++	}
++	return strings.ToLower(fields[0]), nil
++}
+diff --git a/internal/config/provider.go b/internal/config/provider.go
+new file mode 100644
+index 0000000..5bfa232
+--- /dev/null
++++ b/internal/config/provider.go
+@@ -0,0 +1,137 @@
++// Package config implements a generic, format-agnostic configuration
++// loader with mandatory checksum validation and load-once immutability.
++//
++// Governance compliance (Sprint B3-003):
++//   - EG-001: The decoder (Unmarshaler) is injected via Load's parameters
++//     rather than imported directly by this package — no service locator,
++//     no hidden global registry of decoders.
++//   - EG-002: Provider itself is a leaf value holder, not the stateless
++//     Decision Engine core; nonetheless it upholds immutability strictly
++//     (see Get doc comment) so it is safe to share as a long-lived
++//     singleton dependency injected into stateless consumers.
++//   - EG-003: This package has no awareness of what the configuration
++//     MEANS (fraud rules, thresholds, etc.) — it is a generic T loader.
++//   - EG-004: No YAML/JSON library is imported directly by this file; the
++//     caller supplies the decoding function, keeping this package
++//     dependency-free and framework-agnostic. See yaml_provider.go (in
++//     the deployment package, added separately) for the production YAML
++//     wiring.
++package config
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"strings"
++)
++
++// ErrEmptyPath is returned when Load is called with an empty path.
++var ErrEmptyPath = errors.New("config: path must not be empty")
++
++// ErrNilUnmarshaler is returned when Load is called with a nil decoder.
++var ErrNilUnmarshaler = errors.New("config: unmarshal function must not be nil")
++
++// Unmarshaler decodes raw bytes into the value pointed to by v. This is
++// the seam that keeps this package free of any dependency on a specific
++// serialization format — inject yaml.Unmarshal for production YAML
++// configs, json.Unmarshal for JSON/tests, or any other compatible decoder.
++type Unmarshaler func(data []byte, v any) error
++
++// Provider loads a configuration value of type T exactly once, verifies
++// its integrity via SHA-256 checksum, and exposes it thereafter as an
++// immutable value via Get. There is intentionally NO Reload/Watch method
++// on this type — hot reload is out of scope by design; a new deployment
++// (and therefore a new process, and therefore a new Load call) is the
++// only supported way to pick up configuration changes.
++type Provider[T any] struct {
++	path      string
++	checksum  string
++	raw       []byte
++	unmarshal Unmarshaler
++}
++
++// Load reads the file at path, verifies its SHA-256 checksum against
++// expectedChecksum (produced via Checksum or ChecksumFile), and validates
++// that it decodes successfully with unmarshal. It returns an error —
++// never a panic — for any I/O, checksum, or decode failure.
++//
++// Passing an empty expectedChecksum skips checksum verification; this is
++// intended only for local development against files that change
++// frequently, never for production deployments.
++func Load[T any](path string, expectedChecksum string, unmarshal Unmarshaler) (*Provider[T], error) {
++	if path == "" {
++		return nil, ErrEmptyPath
++	}
++	if unmarshal == nil {
++		return nil, ErrNilUnmarshaler
++	}
++
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return nil, fmt.Errorf("config: reading %q: %w", path, err)
++	}
++
++	actual := Checksum(raw)
++	if expectedChecksum != "" && !strings.EqualFold(actual, expectedChecksum) {
++		return nil, &ErrChecksumMismatch{Path: path, Expected: expectedChecksum, Actual: actual}
++	}
++
++	// Decode once up front purely to validate the file is well-formed —
++	// fail Load() immediately rather than deferring a decode error to
++	// the first Get() call, which would violate "fail fast".
++	var probe T
++	if err := unmarshal(raw, &probe); err != nil {
++		return nil, fmt.Errorf("config: decoding %q: %w", path, err)
++	}
++
++	return &Provider[T]{
++		path:      path,
++		checksum:  actual,
++		raw:       raw,
++		unmarshal: unmarshal,
++	}, nil
++}
++
++// LoadWithChecksumFile is a convenience wrapper around Load that reads
++// the expected checksum from a sidecar file (convention: "<path>.sha256",
++// compatible with both a bare hex digest and `sha256sum`-style output)
++// instead of requiring the caller to pass the digest explicitly.
++func LoadWithChecksumFile[T any](path string, checksumPath string, unmarshal Unmarshaler) (*Provider[T], error) {
++	expected, err := readChecksumFile(checksumPath)
++	if err != nil {
++		return nil, err
++	}
++	return Load[T](path, expected, unmarshal)
++}
++
++// Get returns the loaded configuration value. It re-decodes from the
++// Provider's retained immutable raw bytes on every call, rather than
++// returning a single stored struct by reference. This guarantees true
++// immutability regardless of what mutable structures (slices, maps,
++// pointers) T contains: a caller can freely mutate the value returned by
++// Get without ever affecting the Provider's internal state or any other
++// caller's independently-decoded copy.
++//
++// The decode error path is unreachable in normal operation, because Load
++// already proved raw decodes successfully into T; it is preserved here so
++// Get remains panic-free even under adversarial use (e.g. a
++// non-deterministic custom Unmarshaler), consistent with "fail fast, no
++// panic".
++func (p *Provider[T]) Get() (T, error) {
++	var value T
++	if err := p.unmarshal(p.raw, &value); err != nil {
++		var zero T
++		return zero, fmt.Errorf("config: re-decoding cached config for %q: %w", p.path, err)
++	}
++	return value, nil
++}
++
++// Checksum returns the verified SHA-256 checksum of the loaded file.
++func (p *Provider[T]) Checksum() string {
++	return p.checksum
++}
++
++// Path returns the filesystem path this Provider was loaded from.
++func (p *Provider[T]) Path() string {
++	return p.path
++}
+diff --git a/internal/config/provider_test.go b/internal/config/provider_test.go
+new file mode 100644
+index 0000000..ff993bd
+--- /dev/null
++++ b/internal/config/provider_test.go
+@@ -0,0 +1,331 @@
++package config
++
++import (
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++// testConfig is a stand-in configuration shape used only by these tests.
++// Its content is irrelevant — what matters is that Provider correctly
++// loads, checksums, and immutably serves ANY type T.
++type testConfig struct {
++	Name    string   `json:"name"`
++	Version int      `json:"version"`
++	Tags    []string `json:"tags"`
++}
++
++// jsonUnmarshaler adapts encoding/json to the Unmarshaler signature. Using
++// JSON here (rather than YAML) keeps this test suite 100% dependency-free
++// and runnable fully offline — Provider's logic is decoder-agnostic by
++// design (see provider.go), so this proves the same guarantees Load/Get
++// will provide in production with a YAML decoder injected instead.
++func jsonUnmarshaler(data []byte, v any) error {
++	return json.Unmarshal(data, v)
++}
++
++func writeTempConfig(t *testing.T, content string) string {
++	t.Helper()
++	dir := t.TempDir()
++	path := filepath.Join(dir, "config.json")
++	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
++		t.Fatalf("failed to write temp config: %v", err)
++	}
++	return path
++}
++
++const validConfigJSON = `{"name":"vguard","version":2,"tags":["fraud","enterprise"]}`
++
++func TestLoad(t *testing.T) {
++	t.Run("loads successfully with no checksum verification requested", func(t *testing.T) {
++		path := writeTempConfig(t, validConfigJSON)
++
++		p, err := Load[testConfig](path, "", jsonUnmarshaler)
++		if err != nil {
++			t.Fatalf("Load failed: %v", err)
++		}
++
++		got, err := p.Get()
++		if err != nil {
++			t.Fatalf("Get failed: %v", err)
++		}
++		if got.Name != "vguard" || got.Version != 2 || len(got.Tags) != 2 {
++			t.Fatalf("unexpected decoded value: %+v", got)
++		}
++	})
++
++	t.Run("loads successfully with correct checksum", func(t *testing.T) {
++		path := writeTempConfig(t, validConfigJSON)
++		expected := Checksum([]byte(validConfigJSON))
++
++		p, err := Load[testConfig](path, expected, jsonUnmarshaler)
++		if err != nil {
++			t.Fatalf("Load failed: %v", err)
++		}
++		if p.Checksum() != expected {
++			t.Errorf("Checksum() = %q, want %q", p.Checksum(), expected)
++		}
++		if p.Path() != path {
++			t.Errorf("Path() = %q, want %q", p.Path(), path)
++		}
++	})
++
++	t.Run("checksum comparison is case-insensitive", func(t *testing.T) {
++		path := writeTempConfig(t, validConfigJSON)
++		expected := Checksum([]byte(validConfigJSON))
++
++		_, err := Load[testConfig](path, upper(expected), jsonUnmarshaler)
++		if err != nil {
++			t.Fatalf("expected uppercase checksum to still match, got: %v", err)
++		}
++	})
++
++	t.Run("fails with ErrChecksumMismatch on wrong checksum", func(t *testing.T) {
++		path := writeTempConfig(t, validConfigJSON)
++
++		_, err := Load[testConfig](path, "0000000000000000000000000000000000000000000000000000000000000000", jsonUnmarshaler)
++		if err == nil {
++			t.Fatal("expected checksum mismatch error, got nil")
++		}
++		var mismatch *ErrChecksumMismatch
++		if !errors.As(err, &mismatch) {
++			t.Fatalf("expected *ErrChecksumMismatch, got %T: %v", err, err)
++		}
++	})
++
++	t.Run("fails with ErrEmptyPath when path is empty", func(t *testing.T) {
++		_, err := Load[testConfig]("", "", jsonUnmarshaler)
++		if !errors.Is(err, ErrEmptyPath) {
++			t.Fatalf("expected ErrEmptyPath, got %v", err)
++		}
++	})
++
++	t.Run("fails with ErrNilUnmarshaler when decoder is nil", func(t *testing.T) {
++		path := writeTempConfig(t, validConfigJSON)
++		_, err := Load[testConfig](path, "", nil)
++		if !errors.Is(err, ErrNilUnmarshaler) {
++			t.Fatalf("expected ErrNilUnmarshaler, got %v", err)
++		}
++	})
++
++	t.Run("fails when file does not exist", func(t *testing.T) {
++		_, err := Load[testConfig]("/nonexistent/path/config.json", "", jsonUnmarshaler)
++		if err == nil {
++			t.Fatal("expected error for nonexistent file, got nil")
++		}
++	})
++
++	t.Run("fails fast on malformed content at Load time, not Get time", func(t *testing.T) {
++		path := writeTempConfig(t, `{not valid json`)
++		_, err := Load[testConfig](path, "", jsonUnmarshaler)
++		if err == nil {
++			t.Fatal("expected decode error at Load time, got nil")
++		}
++	})
++
++	t.Run("never panics on any input combination", func(t *testing.T) {
++		defer func() {
++			if r := recover(); r != nil {
++				t.Fatalf("Load panicked: %v", r)
++			}
++		}()
++		_, _ = Load[testConfig]("", "", nil)
++		_, _ = Load[testConfig]("/does/not/exist", "deadbeef", jsonUnmarshaler)
++	})
++}
++
++func TestLoadWithChecksumFile(t *testing.T) {
++	t.Run("loads using digest from sidecar file", func(t *testing.T) {
++		path := writeTempConfig(t, validConfigJSON)
++		expected := Checksum([]byte(validConfigJSON))
++
++		checksumPath := path + ".sha256"
++		if err := os.WriteFile(checksumPath, []byte(expected+"\n"), 0o600); err != nil {
++			t.Fatalf("failed to write checksum file: %v", err)
++		}
++
++		p, err := LoadWithChecksumFile[testConfig](path, checksumPath, jsonUnmarshaler)
++		if err != nil {
++			t.Fatalf("LoadWithChecksumFile failed: %v", err)
++		}
++		if p.Checksum() != expected {
++			t.Errorf("Checksum() = %q, want %q", p.Checksum(), expected)
++		}
++	})
++
++	t.Run("accepts sha256sum-style output with trailing filename", func(t *testing.T) {
++		path := writeTempConfig(t, validConfigJSON)
++		expected := Checksum([]byte(validConfigJSON))
++
++		checksumPath := path + ".sha256"
++		content := expected + "  config.json\n"
++		if err := os.WriteFile(checksumPath, []byte(content), 0o600); err != nil {
++			t.Fatalf("failed to write checksum file: %v", err)
++		}
++
++		_, err := LoadWithChecksumFile[testConfig](path, checksumPath, jsonUnmarshaler)
++		if err != nil {
++			t.Fatalf("expected sha256sum-style checksum file to work, got: %v", err)
++		}
++	})
++
++	t.Run("fails when checksum file does not exist", func(t *testing.T) {
++		path := writeTempConfig(t, validConfigJSON)
++		_, err := LoadWithChecksumFile[testConfig](path, path+".missing.sha256", jsonUnmarshaler)
++		if err == nil {
++			t.Fatal("expected error for missing checksum file, got nil")
++		}
++	})
++
++	t.Run("fails when checksum file is empty", func(t *testing.T) {
++		path := writeTempConfig(t, validConfigJSON)
++		checksumPath := path + ".sha256"
++		if err := os.WriteFile(checksumPath, []byte("   \n"), 0o600); err != nil {
++			t.Fatalf("failed to write checksum file: %v", err)
++		}
++		_, err := LoadWithChecksumFile[testConfig](path, checksumPath, jsonUnmarshaler)
++		if err == nil {
++			t.Fatal("expected error for empty checksum file, got nil")
++		}
++	})
++}
++
++// TestProvider_Get_IsImmutable proves that mutating a value returned by
++// Get never affects the Provider's internal state or subsequent Get
++// calls — the core "immutable after load" guarantee.
++func TestProvider_Get_IsImmutable(t *testing.T) {
++	path := writeTempConfig(t, validConfigJSON)
++
++	p, err := Load[testConfig](path, "", jsonUnmarshaler)
++	if err != nil {
++		t.Fatalf("Load failed: %v", err)
++	}
++
++	first, err := p.Get()
++	if err != nil {
++		t.Fatalf("Get failed: %v", err)
++	}
++
++	// Mutate the returned value's slice and scalar fields aggressively.
++	first.Name = "mutated"
++	first.Tags[0] = "mutated-tag"
++	first.Tags = append(first.Tags, "extra")
++
++	second, err := p.Get()
++	if err != nil {
++		t.Fatalf("second Get failed: %v", err)
++	}
++
++	if second.Name != "vguard" {
++		t.Errorf("Provider state was mutated: Name = %q, want %q", second.Name, "vguard")
++	}
++	if second.Tags[0] != "fraud" {
++		t.Errorf("Provider state was mutated: Tags[0] = %q, want %q", second.Tags[0], "fraud")
++	}
++	if len(second.Tags) != 2 {
++		t.Errorf("Provider state was mutated: len(Tags) = %d, want 2", len(second.Tags))
++	}
++}
++
++// TestProvider_NoReloadMethod is a compile-time-flavored regression guard:
++// there is intentionally no Reload/Watch method on Provider. This test
++// exists primarily as executable documentation; if such a method is ever
++// added, the governance review for this package should be re-triggered.
++func TestProvider_NoReloadMethod(t *testing.T) {
++	path := writeTempConfig(t, validConfigJSON)
++	p, err := Load[testConfig](path, "", jsonUnmarshaler)
++	if err != nil {
++		t.Fatalf("Load failed: %v", err)
++	}
++
++	// Modify the underlying file after loading...
++	if err := os.WriteFile(path, []byte(`{"name":"changed","version":99,"tags":["x"]}`), 0o600); err != nil {
++		t.Fatalf("failed to overwrite config file: %v", err)
++	}
++
++	// ...and confirm Get() still returns the ORIGINALLY loaded value,
++	// proving there is no hot reload / no re-read from disk.
++	got, err := p.Get()
++	if err != nil {
++		t.Fatalf("Get failed: %v", err)
++	}
++	if got.Name != "vguard" {
++		t.Fatalf("expected Provider to retain originally loaded value, got Name=%q (hot reload should not happen)", got.Name)
++	}
++}
++
++// TestProvider_Get_DefensiveErrorPath covers the defensive branch in
++// Get() where re-decoding fails even though the initial Load succeeded.
++// This is unreachable with a well-behaved decoder in normal operation
++// (Load already proved raw decodes cleanly), but Get must still handle it
++// without panicking — e.g. a decoder with non-deterministic or
++// call-count-dependent behavior. This test injects exactly such a
++// decoder to exercise that path deterministically.
++func TestProvider_Get_DefensiveErrorPath(t *testing.T) {
++	path := writeTempConfig(t, validConfigJSON)
++
++	calls := 0
++	flakyUnmarshal := func(data []byte, v any) error {
++		calls++
++		if calls == 1 {
++			// First call happens inside Load — must succeed so Load
++			// itself does not reject the file.
++			return json.Unmarshal(data, v)
++		}
++		// Every subsequent call (i.e. from Get) fails, to exercise
++		// Get's defensive error-handling path.
++		return errors.New("simulated decode failure on re-decode")
++	}
++
++	p, err := Load[testConfig](path, "", flakyUnmarshal)
++	if err != nil {
++		t.Fatalf("Load should succeed on first decode, got: %v", err)
++	}
++
++	_, err = p.Get()
++	if err == nil {
++		t.Fatal("expected Get to surface the simulated re-decode error, got nil")
++	}
++}
++
++func TestChecksumFile(t *testing.T) {
++	path := writeTempConfig(t, validConfigJSON)
++
++	got, err := ChecksumFile(path)
++	if err != nil {
++		t.Fatalf("ChecksumFile failed: %v", err)
++	}
++	want := Checksum([]byte(validConfigJSON))
++	if got != want {
++		t.Errorf("ChecksumFile() = %q, want %q", got, want)
++	}
++}
++
++func TestChecksumFile_NonexistentFile(t *testing.T) {
++	_, err := ChecksumFile("/nonexistent/path/config.json")
++	if err == nil {
++		t.Fatal("expected error for nonexistent file, got nil")
++	}
++}
++
++func TestErrChecksumMismatch_Error(t *testing.T) {
++	err := &ErrChecksumMismatch{Path: "config.yaml", Expected: "aaa", Actual: "bbb"}
++	msg := err.Error()
++	if msg == "" {
++		t.Fatal("expected non-empty error message")
++	}
++}
++
++// upper is a tiny test-local helper avoiding an extra import of strings
++// in the test table just for one uppercase conversion.
++func upper(s string) string {
++	b := []byte(s)
++	for i, c := range b {
++		if c >= 'a' && c <= 'z' {
++			b[i] = c - 32
++		}
++	}
++	return string(b)
++}
+diff --git a/internal/config/yaml_provider.go.snippet b/internal/config/yaml_provider.go.snippet
+new file mode 100644
+index 0000000..6a875b6
+--- /dev/null
++++ b/internal/config/yaml_provider.go.snippet
+@@ -0,0 +1,54 @@
++//go:build vguard_yaml_provider
++
++// NOTE — FILE EXTENSION IS INTENTIONALLY ".go.snippet", NOT ".go"
++// =============================================================================
++// This file could NOT be fetched/verified in the sandboxed execution
++// environment used to produce this patch: gopkg.in (which gopkg.in/yaml.v3
++// resolves through) is not reachable from that sandbox's network egress
++// allowlist, so `go get gopkg.in/yaml.v3` and therefore `go build`/`go test`
++// could not be run against this file there.
++//
++// TO ACTIVATE THIS FILE:
++//   1. Rename it to yaml_provider.go (drop the .snippet extension).
++//   2. Remove the //go:build vguard_yaml_provider line above (it exists
++//      only so this file is excluded from any build until you're ready).
++//   3. Run: go get gopkg.in/yaml.v3
++//   4. Run: go mod tidy
++//   5. Run: go build ./... && go test ./internal/config/...
++//
++// The rest of internal/config (provider.go, checksum.go) is fully tested
++// and 100%-covered WITHOUT this file — it only adds a thin, low-risk
++// convenience wrapper on top of the already-verified Provider[T] engine.
++// =============================================================================
++
++package config
++
++import "gopkg.in/yaml.v3"
++
++// NewYAMLProvider is the production convenience constructor for loading
++// YAML configuration files, satisfying the "Load YAML" requirement of
++// Sprint B3-003. It is a thin wrapper around the generic, decoder-agnostic
++// Load function — all checksum validation, immutability, and error
++// handling behavior is inherited unchanged and already covered by
++// provider_test.go.
++//
++// Example:
++//
++//	type RulesConfig struct {
++//	    Rules []RuleDefinition `yaml:"rules"`
++//	}
++//
++//	provider, err := config.NewYAMLProvider[RulesConfig](
++//	    "configs/rules.yaml",
++//	    expectedChecksum,
++//	)
++func NewYAMLProvider[T any](path string, expectedChecksum string) (*Provider[T], error) {
++	return Load[T](path, expectedChecksum, yaml.Unmarshal)
++}
++
++// NewYAMLProviderWithChecksumFile is the YAML-flavored equivalent of
++// LoadWithChecksumFile, reading the expected checksum from a sidecar
++// "<path>.sha256" file.
++func NewYAMLProviderWithChecksumFile[T any](path string, checksumPath string) (*Provider[T], error) {
++	return LoadWithChecksumFile[T](path, checksumPath, yaml.Unmarshal)
++}
+diff --git a/internal/validator/request_validator.go b/internal/validator/request_validator.go
+new file mode 100644
+index 0000000..bf4da29
+--- /dev/null
++++ b/internal/validator/request_validator.go
+@@ -0,0 +1,204 @@
++// Package validator implements schema-only validation for the canonical
++// DecisionRequest contract.
++//
++// Governance compliance (Sprint B3-003):
++//   - EG-001: RequestValidator takes all dependencies via its constructor
++//     (NewRequestValidator). No package-level state, no service locator.
++//   - EG-002: RequestValidator holds no runtime/mutable state. The only
++//     field is an injected pure function (clock) used for deterministic
++//     timestamp checks; Validate never mutates the validator itself.
++//   - EG-003: This package validates SHAPE ONLY (required fields, formats,
++//     numeric ranges). It never references fraud rules, thresholds, or any
++//     configuration — that is explicitly out of scope here.
++//   - EG-004: No HTTP/Kafka/framework imports. Standard library only.
++package validator
++
++import (
++	"math"
++	"regexp"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/vguard-ai/decision-engine/contracts"
++)
++
++// uuidPattern matches canonical UUID v1-v5 textual representation.
++// Kept as a package-level compiled regexp (immutable, not runtime state)
++// for performance; this is a constant, not a global variable holding state.
++var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
++
++// currencyPattern matches a 3-letter uppercase ISO-4217-shaped code.
++// Format-only check — does NOT validate against a real currency list,
++// since that would be a business/reference-data concern, not schema.
++var currencyPattern = regexp.MustCompile(`^[A-Z]{3}$`)
++
++const (
++	maxTransactionIDLength = 128
++	maxStoreIDLength       = 64
++	maxCashierIDLength     = 64
++	maxItemsCount          = 500
++	maxSKULength           = 128
++	maxAmount              = 1_000_000_000 // defensive schema ceiling, not a business threshold
++	maxFutureClockSkew     = 5 * time.Minute
++)
++
++// Validator is the contract every request validator implementation must
++// satisfy. Defined here (consumer side) so callers can depend on the
++// interface and inject any implementation — real or mock — per EG-001.
++type Validator interface {
++	Validate(req contracts.DecisionRequest) ValidationErrors
++}
++
++// RequestValidator is the production implementation of Validator for
++// contracts.DecisionRequest. It is safe for concurrent use: it holds no
++// mutable state (EG-002), so a single instance can be shared across
++// goroutines/requests without synchronization.
++type RequestValidator struct {
++	now func() time.Time
++}
++
++// NewRequestValidator constructs a RequestValidator. Pass nil for now to
++// use time.Now; providing an explicit clock function is recommended in
++// tests for deterministic timestamp-window assertions.
++func NewRequestValidator(now func() time.Time) *RequestValidator {
++	if now == nil {
++		now = time.Now
++	}
++	return &RequestValidator{now: now}
++}
++
++// Validate performs deterministic, side-effect-free schema validation of
++// req. It never panics: all field access is nil/zero-value safe. Every
++// applicable violation is collected and returned together (rather than
++// stopping at the first failure) so a caller can surface a complete list
++// to the client in a single round trip; "fail fast" here means the method
++// does no I/O and no expensive work — it fails fast into a returned value,
++// not via early-return-on-first-error control flow.
++//
++// A nil/empty return value (zero-length ValidationErrors) means req is
++// schema-valid.
++func (v *RequestValidator) Validate(req contracts.DecisionRequest) ValidationErrors {
++	var errs ValidationErrors
++
++	v.validateCorrelationID(req, &errs)
++	v.validateTransactionID(req, &errs)
++	v.validateStoreID(req, &errs)
++	v.validateCashierID(req, &errs)
++	v.validateAmount(req, &errs)
++	v.validateCurrency(req, &errs)
++	v.validateItems(req, &errs)
++	v.validateTimestamp(req, &errs)
++
++	return errs
++}
++
++func (v *RequestValidator) validateCorrelationID(req contracts.DecisionRequest, errs *ValidationErrors) {
++	id := strings.TrimSpace(req.CorrelationID)
++	if id == "" {
++		errs.add("correlation_id", ErrCodeRequired, "correlation_id must not be empty")
++		return
++	}
++	if !uuidPattern.MatchString(id) {
++		errs.add("correlation_id", ErrCodeInvalidFormat, "correlation_id must be a valid UUID")
++	}
++}
++
++func (v *RequestValidator) validateTransactionID(req contracts.DecisionRequest, errs *ValidationErrors) {
++	id := strings.TrimSpace(req.TransactionID)
++	if id == "" {
++		errs.add("transaction_id", ErrCodeRequired, "transaction_id must not be empty")
++		return
++	}
++	if len(id) > maxTransactionIDLength {
++		errs.add("transaction_id", ErrCodeOutOfRange, "transaction_id exceeds maximum length")
++	}
++}
++
++func (v *RequestValidator) validateStoreID(req contracts.DecisionRequest, errs *ValidationErrors) {
++	id := strings.TrimSpace(req.StoreID)
++	if id == "" {
++		errs.add("store_id", ErrCodeRequired, "store_id must not be empty")
++		return
++	}
++	if len(id) > maxStoreIDLength {
++		errs.add("store_id", ErrCodeOutOfRange, "store_id exceeds maximum length")
++	}
++}
++
++func (v *RequestValidator) validateCashierID(req contracts.DecisionRequest, errs *ValidationErrors) {
++	id := strings.TrimSpace(req.CashierID)
++	if id == "" {
++		errs.add("cashier_id", ErrCodeRequired, "cashier_id must not be empty")
++		return
++	}
++	if len(id) > maxCashierIDLength {
++		errs.add("cashier_id", ErrCodeOutOfRange, "cashier_id exceeds maximum length")
++	}
++}
++
++func (v *RequestValidator) validateAmount(req contracts.DecisionRequest, errs *ValidationErrors) {
++	if math.IsNaN(req.Amount) || math.IsInf(req.Amount, 0) {
++		errs.add("amount", ErrCodeInvalidValue, "amount must be a finite number")
++		return
++	}
++	if req.Amount <= 0 {
++		errs.add("amount", ErrCodeOutOfRange, "amount must be greater than zero")
++		return
++	}
++	if req.Amount > maxAmount {
++		errs.add("amount", ErrCodeOutOfRange, "amount exceeds maximum allowed schema value")
++	}
++}
++
++func (v *RequestValidator) validateCurrency(req contracts.DecisionRequest, errs *ValidationErrors) {
++	// Currency is optional at the schema level; only validate format if present.
++	if req.Currency == "" {
++		return
++	}
++	if !currencyPattern.MatchString(req.Currency) {
++		errs.add("currency", ErrCodeInvalidFormat, "currency must be a 3-letter uppercase ISO-4217-shaped code")
++	}
++}
++
++func (v *RequestValidator) validateItems(req contracts.DecisionRequest, errs *ValidationErrors) {
++	if len(req.Items) == 0 {
++		errs.add("items", ErrCodeRequired, "items must contain at least one entry")
++		return
++	}
++	if len(req.Items) > maxItemsCount {
++		errs.add("items", ErrCodeOutOfRange, "items exceeds maximum allowed count")
++	}
++
++	for i, item := range req.Items {
++		prefix := "items[" + strconv.Itoa(i) + "]"
++
++		sku := strings.TrimSpace(item.SKU)
++		if sku == "" {
++			errs.add(prefix+".sku", ErrCodeRequired, "sku must not be empty")
++		} else if len(sku) > maxSKULength {
++			errs.add(prefix+".sku", ErrCodeOutOfRange, "sku exceeds maximum length")
++		}
++
++		if item.Quantity <= 0 {
++			errs.add(prefix+".quantity", ErrCodeOutOfRange, "quantity must be greater than zero")
++		}
++
++		if math.IsNaN(item.UnitPrice) || math.IsInf(item.UnitPrice, 0) {
++			errs.add(prefix+".unit_price", ErrCodeInvalidValue, "unit_price must be a finite number")
++		} else if item.UnitPrice < 0 {
++			errs.add(prefix+".unit_price", ErrCodeOutOfRange, "unit_price must not be negative")
++		}
++	}
++}
++
++func (v *RequestValidator) validateTimestamp(req contracts.DecisionRequest, errs *ValidationErrors) {
++	if req.Timestamp.IsZero() {
++		errs.add("timestamp", ErrCodeRequired, "timestamp must not be zero-valued")
++		return
++	}
++	now := v.now()
++	if req.Timestamp.After(now.Add(maxFutureClockSkew)) {
++		errs.add("timestamp", ErrCodeOutOfRange, "timestamp must not be more than 5 minutes in the future")
++	}
++}
+diff --git a/internal/validator/validation_error.go b/internal/validator/validation_error.go
+new file mode 100644
+index 0000000..244602b
+--- /dev/null
++++ b/internal/validator/validation_error.go
+@@ -0,0 +1,77 @@
++package validator
++
++import "strings"
++
++// ErrorCode is a closed, contract-stable enumeration of validation failure
++// reasons. Callers (HTTP handlers, gRPC servers, etc.) can safely switch on
++// these codes without depending on Message text, which is human-oriented
++// and may change wording over time.
++type ErrorCode string
++
++const (
++	// ErrCodeRequired indicates a required field was empty/zero-valued.
++	ErrCodeRequired ErrorCode = "REQUIRED"
++	// ErrCodeInvalidFormat indicates a field did not match its expected
++	// shape (e.g. malformed UUID, wrong currency code length).
++	ErrCodeInvalidFormat ErrorCode = "INVALID_FORMAT"
++	// ErrCodeOutOfRange indicates a numeric field was outside the
++	// allowed schema bounds (e.g. negative amount, zero quantity).
++	ErrCodeOutOfRange ErrorCode = "OUT_OF_RANGE"
++	// ErrCodeInvalidValue indicates a structural/semantic schema issue
++	// that doesn't fit REQUIRED/FORMAT/RANGE (e.g. empty items slice).
++	ErrCodeInvalidValue ErrorCode = "INVALID_VALUE"
++)
++
++// ValidationError describes exactly one field-level schema violation.
++// It intentionally carries no business-logic context (no risk scores,
++// no rule references) — schema validation only, per EG-003.
++type ValidationError struct {
++	// Field is the dot-path to the offending field, e.g. "items[2].quantity".
++	Field string `json:"field"`
++	// Code is a stable machine-readable failure reason.
++	Code ErrorCode `json:"code"`
++	// Message is a human-readable explanation, safe to display to
++	// operators but not guaranteed stable across versions.
++	Message string `json:"message"`
++}
++
++// Error implements the standard library error interface so a single
++// ValidationError can be used anywhere a plain error is expected.
++func (e ValidationError) Error() string {
++	return e.Field + ": " + e.Message + " (" + string(e.Code) + ")"
++}
++
++// ValidationErrors is an ordered collection of ValidationError. Order is
++// deterministic (field declaration order in DecisionRequest), which is
++// required for reproducible tests and stable client-facing output.
++type ValidationErrors []ValidationError
++
++// Error implements the standard library error interface, joining all
++// individual field errors into one human-readable message. Returns an
++// empty string when there are no errors — callers should prefer HasErrors()
++// for control flow rather than checking Error() == "".
++func (e ValidationErrors) Error() string {
++	if len(e) == 0 {
++		return ""
++	}
++	parts := make([]string, 0, len(e))
++	for _, fe := range e {
++		parts = append(parts, fe.Error())
++	}
++	return strings.Join(parts, "; ")
++}
++
++// HasErrors reports whether the collection contains at least one error.
++// This is the preferred way to check validation outcome:
++//
++//	errs := v.Validate(req)
++//	if errs.HasErrors() { ... }
++func (e ValidationErrors) HasErrors() bool {
++	return len(e) > 0
++}
++
++// add is an unexported convenience used only within this package to keep
++// request_validator.go free of repetitive struct literals.
++func (e *ValidationErrors) add(field string, code ErrorCode, message string) {
++	*e = append(*e, ValidationError{Field: field, Code: code, Message: message})
++}
+diff --git a/internal/validator/validator_test.go b/internal/validator/validator_test.go
+new file mode 100644
+index 0000000..64cf6da
+--- /dev/null
++++ b/internal/validator/validator_test.go
+@@ -0,0 +1,428 @@
++package validator
++
++import (
++	"testing"
++	"time"
++
++	"github.com/vguard-ai/decision-engine/contracts"
++)
++
++// fixedClock returns a deterministic clock function pinned to t, so tests
++// never depend on wall-clock time (required for 100% deterministic tests).
++func fixedClock(t time.Time) func() time.Time {
++	return func() time.Time { return t }
++}
++
++// validRequest returns a DecisionRequest that satisfies every schema rule.
++// Individual test cases mutate a copy of this to isolate exactly one
++// violation at a time (plus a few combined-violation cases).
++func validRequest(now time.Time) contracts.DecisionRequest {
++	return contracts.DecisionRequest{
++		CorrelationID: "a1b2c3d4-e5f6-47a8-b9c0-d1e2f3a4b5c6",
++		TransactionID: "TRX-00123",
++		StoreID:       "STORE-01",
++		CashierID:     "CASHIER-07",
++		Amount:        150000,
++		Currency:      "IDR",
++		Items: []contracts.Item{
++			{SKU: "SKU-001", Name: "Item A", Quantity: 2, UnitPrice: 50000},
++			{SKU: "SKU-002", Name: "Item B", Quantity: 1, UnitPrice: 50000},
++		},
++		Timestamp: now.Add(-1 * time.Minute),
++	}
++}
++
++func TestRequestValidator_Validate(t *testing.T) {
++	now := time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC)
++
++	tests := []struct {
++		name       string
++		mutate     func(contracts.DecisionRequest) contracts.DecisionRequest
++		wantFields []string // field paths expected to have at least one error
++		wantValid  bool
++	}{
++		{
++			name:      "fully valid request produces no errors",
++			mutate:    func(r contracts.DecisionRequest) contracts.DecisionRequest { return r },
++			wantValid: true,
++		},
++		{
++			name: "empty correlation_id",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.CorrelationID = ""
++				return r
++			},
++			wantFields: []string{"correlation_id"},
++		},
++		{
++			name: "whitespace-only correlation_id treated as empty",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.CorrelationID = "   "
++				return r
++			},
++			wantFields: []string{"correlation_id"},
++		},
++		{
++			name: "malformed correlation_id",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.CorrelationID = "not-a-uuid"
++				return r
++			},
++			wantFields: []string{"correlation_id"},
++		},
++		{
++			name: "empty transaction_id",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.TransactionID = ""
++				return r
++			},
++			wantFields: []string{"transaction_id"},
++		},
++		{
++			name: "transaction_id too long",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				long := make([]byte, maxTransactionIDLength+1)
++				for i := range long {
++					long[i] = 'a'
++				}
++				r.TransactionID = string(long)
++				return r
++			},
++			wantFields: []string{"transaction_id"},
++		},
++		{
++			name: "empty store_id",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.StoreID = ""
++				return r
++			},
++			wantFields: []string{"store_id"},
++		},
++		{
++			name: "store_id too long",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				long := make([]byte, maxStoreIDLength+1)
++				for i := range long {
++					long[i] = 'a'
++				}
++				r.StoreID = string(long)
++				return r
++			},
++			wantFields: []string{"store_id"},
++		},
++		{
++			name: "empty cashier_id",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.CashierID = ""
++				return r
++			},
++			wantFields: []string{"cashier_id"},
++		},
++		{
++			name: "cashier_id too long",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				long := make([]byte, maxCashierIDLength+1)
++				for i := range long {
++					long[i] = 'a'
++				}
++				r.CashierID = string(long)
++				return r
++			},
++			wantFields: []string{"cashier_id"},
++		},
++		{
++			name: "zero amount",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Amount = 0
++				return r
++			},
++			wantFields: []string{"amount"},
++		},
++		{
++			name: "negative amount",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Amount = -100
++				return r
++			},
++			wantFields: []string{"amount"},
++		},
++		{
++			name: "NaN amount",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Amount = nan()
++				return r
++			},
++			wantFields: []string{"amount"},
++		},
++		{
++			name: "Inf amount",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Amount = inf()
++				return r
++			},
++			wantFields: []string{"amount"},
++		},
++		{
++			name: "amount exceeds schema ceiling",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Amount = maxAmount + 1
++				return r
++			},
++			wantFields: []string{"amount"},
++		},
++		{
++			name: "empty currency is allowed (optional field)",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Currency = ""
++				return r
++			},
++			wantValid: true,
++		},
++		{
++			name: "malformed currency",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Currency = "idr"
++				return r
++			},
++			wantFields: []string{"currency"},
++		},
++		{
++			name: "malformed currency wrong length",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Currency = "IDRX"
++				return r
++			},
++			wantFields: []string{"currency"},
++		},
++		{
++			name: "empty items slice",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Items = nil
++				return r
++			},
++			wantFields: []string{"items"},
++		},
++		{
++			name: "too many items",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				items := make([]contracts.Item, maxItemsCount+1)
++				for i := range items {
++					items[i] = contracts.Item{SKU: "SKU", Quantity: 1, UnitPrice: 1}
++				}
++				r.Items = items
++				return r
++			},
++			wantFields: []string{"items"},
++		},
++		{
++			name: "item with empty sku",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Items[0].SKU = ""
++				return r
++			},
++			wantFields: []string{"items[0].sku"},
++		},
++		{
++			name: "item sku too long",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				long := make([]byte, maxSKULength+1)
++				for i := range long {
++					long[i] = 'a'
++				}
++				r.Items[0].SKU = string(long)
++				return r
++			},
++			wantFields: []string{"items[0].sku"},
++		},
++		{
++			name: "item with zero quantity",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Items[0].Quantity = 0
++				return r
++			},
++			wantFields: []string{"items[0].quantity"},
++		},
++		{
++			name: "item with negative quantity",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Items[0].Quantity = -5
++				return r
++			},
++			wantFields: []string{"items[0].quantity"},
++		},
++		{
++			name: "item with negative unit_price",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Items[0].UnitPrice = -1
++				return r
++			},
++			wantFields: []string{"items[0].unit_price"},
++		},
++		{
++			name: "item with NaN unit_price",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Items[0].UnitPrice = nan()
++				return r
++			},
++			wantFields: []string{"items[0].unit_price"},
++		},
++		{
++			name: "item with zero unit_price is allowed (e.g. free promo item)",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Items[0].UnitPrice = 0
++				return r
++			},
++			wantValid: true,
++		},
++		{
++			name: "second item invalid produces indexed field path",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Items[1].Quantity = 0
++				return r
++			},
++			wantFields: []string{"items[1].quantity"},
++		},
++		{
++			name: "zero-valued timestamp",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Timestamp = time.Time{}
++				return r
++			},
++			wantFields: []string{"timestamp"},
++		},
++		{
++			name: "timestamp too far in the future",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Timestamp = now.Add(10 * time.Minute)
++				return r
++			},
++			wantFields: []string{"timestamp"},
++		},
++		{
++			name: "timestamp within allowed clock skew is valid",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Timestamp = now.Add(4 * time.Minute)
++				return r
++			},
++			wantValid: true,
++		},
++		{
++			name: "timestamp exactly at now is valid",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.Timestamp = now
++				return r
++			},
++			wantValid: true,
++		},
++		{
++			name: "multiple simultaneous violations are all reported",
++			mutate: func(r contracts.DecisionRequest) contracts.DecisionRequest {
++				r.CorrelationID = ""
++				r.Amount = -1
++				r.Items = nil
++				return r
++			},
++			wantFields: []string{"correlation_id", "amount", "items"},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			v := NewRequestValidator(fixedClock(now))
++			req := tt.mutate(validRequest(now))
++
++			errs := v.Validate(req)
++
++			if tt.wantValid {
++				if errs.HasErrors() {
++					t.Fatalf("expected no errors, got: %v", errs)
++				}
++				return
++			}
++
++			if !errs.HasErrors() {
++				t.Fatalf("expected errors for fields %v, got none", tt.wantFields)
++			}
++
++			for _, wantField := range tt.wantFields {
++				if !containsField(errs, wantField) {
++					t.Errorf("expected error for field %q, got errors: %v", wantField, errs)
++				}
++			}
++		})
++	}
++}
++
++// TestRequestValidator_NeverPanics feeds a completely zero-valued request
++// (worst case: nil slices, zero time, empty strings) to guarantee the
++// validator never panics regardless of how malformed the input is.
++func TestRequestValidator_NeverPanics(t *testing.T) {
++	defer func() {
++		if r := recover(); r != nil {
++			t.Fatalf("Validate panicked on zero-value request: %v", r)
++		}
++	}()
++
++	v := NewRequestValidator(nil) // exercise the nil-clock default path too
++	_ = v.Validate(contracts.DecisionRequest{})
++}
++
++// TestRequestValidator_DefaultClock exercises NewRequestValidator(nil) to
++// ensure the default time.Now clock path is covered.
++func TestRequestValidator_DefaultClock(t *testing.T) {
++	v := NewRequestValidator(nil)
++	req := validRequest(time.Now())
++	errs := v.Validate(req)
++	if errs.HasErrors() {
++		t.Fatalf("expected valid request to pass with default clock, got: %v", errs)
++	}
++}
++
++func TestValidationErrors_ErrorString(t *testing.T) {
++	var empty ValidationErrors
++	if got := empty.Error(); got != "" {
++		t.Errorf("expected empty string for no errors, got %q", got)
++	}
++
++	errs := ValidationErrors{
++		{Field: "amount", Code: ErrCodeOutOfRange, Message: "must be greater than zero"},
++	}
++	got := errs.Error()
++	want := "amount: must be greater than zero (OUT_OF_RANGE)"
++	if got != want {
++		t.Errorf("Error() = %q, want %q", got, want)
++	}
++}
++
++func TestValidationErrors_HasErrors(t *testing.T) {
++	var empty ValidationErrors
++	if empty.HasErrors() {
++		t.Error("expected HasErrors() false for empty collection")
++	}
++	nonEmpty := ValidationErrors{{Field: "x", Code: ErrCodeRequired, Message: "required"}}
++	if !nonEmpty.HasErrors() {
++		t.Error("expected HasErrors() true for non-empty collection")
++	}
++}
++
++// --- test helpers -----------------------------------------------------
++
++func containsField(errs ValidationErrors, field string) bool {
++	for _, e := range errs {
++		if e.Field == field {
++			return true
++		}
++	}
++	return false
++}
++
++func nan() float64 {
++	var zero float64
++	return zero / zero //nolint:staticcheck // intentional NaN construction for test fixture
++}
++
++func inf() float64 {
++	var zero float64
++	one := 1.0
++	return one / zero //nolint:staticcheck // intentional +Inf construction for test fixture
++}
+-- 
+2.43.0
+

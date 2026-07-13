@@ -1,0 +1,54 @@
+//go:build vguard_yaml_provider
+
+// NOTE — FILE EXTENSION IS INTENTIONALLY ".go.snippet", NOT ".go"
+// =============================================================================
+// This file could NOT be fetched/verified in the sandboxed execution
+// environment used to produce this patch: gopkg.in (which gopkg.in/yaml.v3
+// resolves through) is not reachable from that sandbox's network egress
+// allowlist, so `go get gopkg.in/yaml.v3` and therefore `go build`/`go test`
+// could not be run against this file there.
+//
+// TO ACTIVATE THIS FILE:
+//   1. Rename it to yaml_provider.go (drop the .snippet extension).
+//   2. Remove the //go:build vguard_yaml_provider line above (it exists
+//      only so this file is excluded from any build until you're ready).
+//   3. Run: go get gopkg.in/yaml.v3
+//   4. Run: go mod tidy
+//   5. Run: go build ./... && go test ./internal/config/...
+//
+// The rest of internal/config (provider.go, checksum.go) is fully tested
+// and 100%-covered WITHOUT this file — it only adds a thin, low-risk
+// convenience wrapper on top of the already-verified Provider[T] engine.
+// =============================================================================
+
+package config
+
+import "gopkg.in/yaml.v3"
+
+// NewYAMLProvider is the production convenience constructor for loading
+// YAML configuration files, satisfying the "Load YAML" requirement of
+// Sprint B3-003. It is a thin wrapper around the generic, decoder-agnostic
+// Load function — all checksum validation, immutability, and error
+// handling behavior is inherited unchanged and already covered by
+// provider_test.go.
+//
+// Example:
+//
+//	type RulesConfig struct {
+//	    Rules []RuleDefinition `yaml:"rules"`
+//	}
+//
+//	provider, err := config.NewYAMLProvider[RulesConfig](
+//	    "configs/rules.yaml",
+//	    expectedChecksum,
+//	)
+func NewYAMLProvider[T any](path string, expectedChecksum string) (*Provider[T], error) {
+	return Load[T](path, expectedChecksum, yaml.Unmarshal)
+}
+
+// NewYAMLProviderWithChecksumFile is the YAML-flavored equivalent of
+// LoadWithChecksumFile, reading the expected checksum from a sidecar
+// "<path>.sha256" file.
+func NewYAMLProviderWithChecksumFile[T any](path string, checksumPath string) (*Provider[T], error) {
+	return LoadWithChecksumFile[T](path, checksumPath, yaml.Unmarshal)
+}
